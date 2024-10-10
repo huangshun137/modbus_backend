@@ -1,7 +1,7 @@
 const WebSocket = require('ws');
 
 // 创建 WebSocket 服务器
-const wss = new WebSocket.Server({ port: 8088 });
+const wss = new WebSocket.Server({ port: 8089 });
 
 // 存储客户端连接
 const clients = new Map();
@@ -9,7 +9,11 @@ const clients = new Map();
 // 当有新的连接时
 wss.on('connection', (ws, req) => {
   // 获取客户端的 ID 或其他唯一标识符
-  const clientId = req.url.split('/').pop();
+  const _list = req.url.split('/');
+  let clientId = _list.pop();
+  if (clientId === 'modbusStatus') {
+    clientId = `/${_list.pop()}/${clientId}`;
+  }
 
   console.log(`Client ${clientId} connected.`);
 

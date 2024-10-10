@@ -10,8 +10,10 @@
   "license": "ISC",
   "description": "",
   "dependencies": {
+    "dayjs": "^1.11.13",
     "express": "^4.19.2",
     "modbus-serial": "^8.0.17",
+    "mysql": "^2.18.1",
     "ws": "^8.18.0"
   }
 }

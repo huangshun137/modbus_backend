@@ -2,48 +2,57 @@
 const express = require('express');
 const router = express.Router();
 const ModbusRTU = require("modbus-serial");
-const client = new ModbusRTU();
+// const client = new ModbusRTU();
 const wsServer = require('./websocket-server');
 
-let modbusStatus, connetTimes = 0;
+let clientMap = new Map();
 // 连接到 Modbus TCP 设备
-function connectToModbusDevice() {
-  client.connectTCP("192.168.1.248", { port: 502 }, function(err) {
+function connectToModbusDevice(id) {
+  const clientInfo = clientMap.get(id);
+  if (!clientInfo) return;
+  const { client, ip, port } = clientInfo;
+  client.connectTCP(ip, { port }, function(err) {
     if (err) {
       console.error("Connection failed:", err);
-      return;
+      return err;
     }
-    modbusStatus = 'connected';
+    clientInfo.modbusStatus = 'connected';
+    wsServer.sendMessageToClient(`/${id}/modbusStatus`, 'connected');
     console.log("Connected to Modbus TCP device.");
   });
 }
 
-// 监听连接成功事件
-client.on("connected", () => {
-  modbusStatus = 'connected';
-  wsServer.sendMessageToClient('modbusStatus', 'connected');
-});
-// 监听错误事件
-client.on('error', function(err) {
-  modbusStatus = 'error';
-  wsServer.sendMessageToClient('modbusStatus', 'error');
-  console.error('Modbus connection error:', err);
-  client.close(); // 关闭旧连接
-  connetTimes = 0;
-  reconnect(); // 尝试重新连接
-});
-// 监听连接关闭事件
-client.on("close", () => {
-  modbusStatus = 'close';
-  wsServer.sendMessageToClient('modbusStatus', 'close');
-  console.log("Connection closed.");
-});
+function handleListenningClient(id) {
+  const clientInfo = clientMap.get(id);
+  if (!clientInfo) return;
+  const { client } = clientInfo;
+  // 监听连接成功事件(好像插件里没有这个connected监听事件)
+  client.on("connected", () => {
+    console.log("123");
+    clientInfo.modbusStatus = 'connected';
+    wsServer.sendMessageToClient(`/${id}/modbusStatus`, 'connected');
+  });
+  // 监听错误事件
+  client.on('error', function(err) {
+    clientInfo.modbusStatus = 'error';
+    wsServer.sendMessageToClient(`/${id}/modbusStatus`, 'error');
+    console.error('Modbus connection error:', err);
+    client.close(); // 关闭旧连接
+    clientInfo.connetTimes = 0;
+    reconnect(clientInfo); // 尝试重新连接
+  });
+  // 监听连接关闭事件
+  client.on("close", () => {
+    clientInfo.modbusStatus = 'close';
+    wsServer.sendMessageToClient(`/${id}/modbusStatus`, 'close');
+    console.log("Connection closed.");
+  });
+}
 
 // 只读状态量（1x）
-function readDiscreteInputs(addr, callback) {
+function readDiscreteInputs(client, addr, count = 2, callback) {
   // 读取指定地址的输入寄存器值
   const address = addr; // 输入寄存器起始地址
-  const count = 2; // 读取的寄存器数量
 
   client.readDiscreteInputs(address, count, function(err, res) {
     if (err) {
@@ -51,15 +60,14 @@ function readDiscreteInputs(addr, callback) {
       return callback(err);
     }
 
-    console.log("Input Registers:", res);
+    console.log("Input Registers:", addr, count, res);
     return callback(null, res.data);
   });
 }
 // 只读寄存器（3x）
-function readInputRegisters(addr, callback) {
+function readInputRegisters(client, addr, count = 2, callback) {
   // 读取指定地址的输入寄存器值
   const address = addr; // 输入寄存器起始地址
-  const count = 2; // 读取的寄存器数量
 
   client.readInputRegisters(address, count, function(err, res) {
     if (err) {
@@ -73,10 +81,9 @@ function readInputRegisters(addr, callback) {
 }
 
 // 保持寄存器-可读可写（4x）
-function readHoldingRegisters(addr, callback) {
+function readHoldingRegisters(client, addr, count = 2, callback) {
   // 读取指定地址的输入寄存器值
   const address = addr; // 输入寄存器起始地址
-  const count = 2; // 读取的寄存器数量
 
   client.readHoldingRegisters(address, count, function(err, res) {
     if (err) {
@@ -90,7 +97,7 @@ function readHoldingRegisters(addr, callback) {
 }
 
 // 保持寄存器-可读可写（4x）
-function writeHoldingRegister(addr, value, callback) {
+function writeHoldingRegister(client, addr, value, callback) {
   // 设置指定地址的寄存器值
   const address = addr; // 寄存器地址
   const regValue = value; // 寄存器值
@@ -106,7 +113,7 @@ function writeHoldingRegister(addr, value, callback) {
   });
 }
 // 写入线圈-可写状态量（0x）
-function writeCoil(addr, value, callback) {
+function writeCoil(client, addr, value, callback) {
   // 设置指定地址的线圈值
   const address = addr; // 线圈地址
   const coilValue = value; // 线圈值
@@ -122,9 +129,6 @@ function writeCoil(addr, value, callback) {
   });
 }
 
-// 在应用启动时建立 Modbus 连接
-connectToModbusDevice();
-
 // 监听信号以优雅地关闭 Modbus 连接
 process.on('SIGINT', function() {
   console.log('Received SIGINT. Gracefully shutting down from CLI...');
@@ -137,37 +141,50 @@ process.on('SIGTERM', function() {
 });
 
 // 使 shutdown 函数异步
-async function shutdown() {
+async function shutdown(clientInfo = null) {
   try {
     console.log('Closing Modbus connection...');
-    await new Promise((resolve, reject) => {
-      client.close((err) => {
-        if (err) {
-          reject(err);
-        } else {
-          console.log('Disconnected from Modbus TCP device.');
-          resolve();
-        }
+    if (clientInfo) {
+      const { connectTimeout, client, id } = clientInfo;
+      return new Promise((resolve, reject) => {
+        connectTimeout && clearTimeout(connectTimeout);
+        client.close((err) => {
+          if (err) {
+            console.error("Error closing connection:", err);
+            reject(err);
+          } else {
+            console.log('Disconnected from Modbus TCP device.');
+            clientMap.delete(id);
+            resolve('done');
+          }
+        });
       });
-    });
+    } else {
+      await Promise.all(Array.from(clientMap.values()).map(clientInfo => shutdown(clientInfo)));
+    }
   } catch (err) {
     console.error('Error during shutdown:', err);
   } finally {
-    process.exit(0); // 确保在所有清理操作完成后退出进程
+    console.log('Exiting process...', clientInfo);
+    !clientInfo && process.exit(0); // 确保在所有清理操作完成后退出进程
   }
 }
 
 // 重连逻辑
-function reconnect() {
-  connetTimes++;
+function reconnect(clientInfo) {
+  const { client, ip, port } = clientInfo;
+  clientInfo.connectTimeout && clearTimeout(clientInfo.connectTimeout);
+  clientInfo.connetTimes++;
   console.log('Attempting to reconnect...');
-  client.connectTCP("192.168.1.248", { port: 502 }, function(err) {
+  client.connectTCP(ip, { port }, function(err) {
     if (err) {
       console.error("Reconnection failed:", err);
-      if (connetTimes < 5) {
-        setTimeout(reconnect, 5000); // 5秒后再次尝试重连
+      if (clientInfo.connetTimes < 5) {
+        clientInfo.connectTimeout = setTimeout(() => reconnect(clientInfo), 5000); // 5秒后再次尝试重连
       }
     } else {
+      clientInfo.modbusStatus = 'connected';
+      wsServer.sendMessageToClient(`/${id}/modbusStatus`, 'connected');
       console.log("Reconnected to Modbus TCP device.");
     }
   });
@@ -193,6 +210,35 @@ function convertToFloatValue(data) {
 
   return floatBuffer.readFloatBE(0); // 读取浮点数
 }
+
+router.get('/startConection', (req, res) => {
+  try {
+    const { modbusIp, modbusPort, id } = req.query;
+    if (!clientMap.has(id)) {
+      clientMap.set(id, {
+        id,
+        ip: modbusIp,
+        port: modbusPort,
+        client: new ModbusRTU(),
+        connectTimeout: null,
+        connetTimes: 0
+      })
+    }
+    handleListenningClient(id);
+    connectToModbusDevice(id);
+    res.send({
+      code: 200,
+      msg: '正在连接',
+      data: null
+    })
+  } catch (error) {
+    res.send({
+      code: 500,
+      msg: error.message,
+      data: null
+    })
+  }
+});
 /**
  * 读取Modbus值
  * @param {*} addr 寄存器地址
@@ -200,17 +246,25 @@ function convertToFloatValue(data) {
  * @param {*} float 存储类型是否为浮点型
  */
 router.get('/getModbusValue', (req, res) => {
-  const { addr, type = '4x', float = false } = req.query;
+  const { addr, type = '4x', float = false, count = 2, id } = req.query;
   const func = readRegistersMap[type];
-  func(addr, (err, result) => {
+  const clientInfo = clientMap.get(id);
+  if (!clientInfo || clientInfo.modbusStatus !== "connected") {
+    res.send({
+      code: 500,
+      msg: 'modbus未成功连接'
+    });
+    return;
+  }
+  func(clientInfo.client, addr, count, (err, result) => {
     if (err) {
       res.status(500).send(`Error reading register: ${err.message}`);
     } else {
       // 假设结果是一个数组，取第一个元素作为寄存器值
-      let _result = result[0];
-      if (float) {
-        _result = convertToFloatValue(result);
-      }
+      let _result = result;
+      // if (float) {
+      //   _result = convertToFloatValue(result);
+      // }
       res.send({
         data: _result
       });
@@ -220,15 +274,20 @@ router.get('/getModbusValue', (req, res) => {
 
 // 获取Modbus状态
 router.get('/status', (req, res) => {
+  const id = req.query.id;
+  const clientInfo = clientMap.get(id);
   res.send({
-    data: modbusStatus
+    data: clientInfo?.modbusStatus
   });
 });
 
 // 获取Modbus所有寄存器值
 const navStatusList = ["无", "等待执行导航", "正在执行导航", "导航暂停", "到达", "失败", "取消", "超时"]
 router.get('/getAllStatus', async (req, res) => {
-  const data = { modbusStatus };
+  const id = req.query.id;
+  const clientInfo = clientMap.get(id);
+
+  const data = { modbusStatus: clientInfo?.modbusStatus };
 
   try {
     // 占用状态 0 -> 可用  1 -> 被占用
@@ -300,9 +359,17 @@ router.get('/getAllStatus', async (req, res) => {
  * @param {*} value 值
  */
 router.post('/setModbusValue', (req, res) => {
-  const { addr, value, type = '4x' } = req.body;
+  const { addr, value, type = '4x', id } = req.body;
   const func = writeRegistersMap[type];
-  func(addr, value, (err, result) => {
+  const clientInfo = clientMap.get(id);
+  if (!clientInfo || clientInfo.modbusStatus !== "connected") {
+    res.send({
+      code: 500,
+      msg: 'modbus未成功连接'
+    });
+    return;
+  }
+  func(clientInfo.client, addr, value, (err, result) => {
     if (err) {
       res.status(500).send(`Error setting register: ${err.message}`);
     } else {
@@ -312,10 +379,52 @@ router.post('/setModbusValue', (req, res) => {
 });
 // 尝试重连
 router.post('/reconnected', (req, res) => {
-  connetTimes = 0;
-  reconnect();
-  res.send({
-    msg: '正在重连...'
-  });
+  const { id } = req.body;
+  const clientInfo = clientMap.get(id);
+  if (!clientInfo) {
+    res.send({
+      code: 500,
+      msg: 'modbus未成功连接'
+    });
+    return;
+  }
+  if (!clientInfo.modbusStatus || clientInfo.modbusStatus === 'close') {
+    connectToModbusDevice(id);
+    res.send({
+      code: 200,
+      msg: '正在连接',
+      data: null
+    })
+  } else {
+    clientInfo.connetTimes = 0;
+    reconnect(clientInfo);
+    res.send({
+      msg: '正在重连...'
+    });
+  }
+});
+// 关闭modbus连接
+router.post('/closeConnect', async (req, res) => {
+  const { id } = req.body;
+  const clientInfo = clientMap.get(id);
+  if (!clientInfo || clientInfo.modbusStatus !== "connected") {
+    res.send({
+      code: 500,
+      msg: 'modbus未成功连接'
+    });
+    return;
+  }
+  const result = await shutdown(clientInfo);
+  if (result === 'done') {
+    res.send({
+      code: 200,
+      msg: '关闭成功'
+    });
+  } else {
+    res.send({
+      code: 500,
+      msg: '关闭失败'
+    });
+  }
 });
 module.exports = router;
